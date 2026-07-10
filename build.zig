@@ -15,6 +15,13 @@ const std = @import("std");
 // to another OS/libc requires regenerating config.h by hand (or via the
 // autotools flow on the zig16-automake branch) and adjusting the HAVE_*
 // defines to match.
+//
+// `zig build test` builds and runs regress/unittests/* (ported from
+// Makefile.in's UNITTESTS_TEST_*_OBJS/`make unit`, see the `unit_tests`
+// array below). All suites pass except test_sshkey, which fails at test
+// #15 ("equal KEY_RSA/demoted KEY_RSA") -- a pre-existing bug unrelated to
+// zig cc or this build.zig (it reproduces identically with a plain gcc +
+// autotools build).
 // ---------------------------------------------------------------------------
 
 // Flags shared by every compiled .c file, taken verbatim from a real
@@ -307,6 +314,121 @@ const programs = [_]Program{
     },
 };
 
+// regress/unittests/*: self-contained unit tests (see also
+// regress/unittests/Makefile.inc, which drives these under the real BSD
+// make; and Makefile.in's UNITTESTS_TEST_*_OBJS, which drives them under
+// the portable autotools/GNU-make build -- this list is derived from the
+// latter). Every test links against libtest_helper + the full libssh +
+// libopenbsd_compat, exactly like the "ssh" client program.
+const UnitTest = struct {
+    name: []const u8,
+    dir: []const u8,
+    /// Sources under `dir`, without the directory prefix.
+    sources: []const []const u8,
+    /// Extra non-test sources needed directly (not provided by libssh),
+    /// e.g. auth-options.c for authopt, servconf.c for servconf.
+    extra_sources: []const []const u8 = &.{},
+    /// Needs ssh-pkcs11-client.c/ssh-sk-client.c directly.
+    needs_p11sk: bool = false,
+    /// Run with `-d <dir>/testdata`.
+    needs_testdata: bool = false,
+};
+
+const unit_tests = [_]UnitTest{
+    .{
+        .name = "test_sshbuf",
+        .dir = "regress/unittests/sshbuf",
+        .sources = &[_][]const u8{
+            "tests.c", "test_sshbuf.c", "test_sshbuf_getput_basic.c",
+            "test_sshbuf_getput_crypto.c", "test_sshbuf_misc.c",
+            "test_sshbuf_fuzz.c", "test_sshbuf_getput_fuzz.c", "test_sshbuf_fixed.c",
+        },
+    },
+    .{
+        .name = "test_sshkey",
+        .dir = "regress/unittests/sshkey",
+        .sources = &[_][]const u8{ "test_fuzz.c", "tests.c", "common.c", "test_file.c", "test_sshkey.c" },
+        .needs_p11sk = true,
+        .needs_testdata = true,
+    },
+    .{
+        .name = "test_sshsig",
+        .dir = "regress/unittests/sshsig",
+        .sources = &[_][]const u8{"tests.c"},
+        .extra_sources = &[_][]const u8{"sshsig.c"},
+        .needs_p11sk = true,
+        .needs_testdata = true,
+    },
+    .{
+        .name = "test_authopt",
+        .dir = "regress/unittests/authopt",
+        .sources = &[_][]const u8{"tests.c"},
+        .extra_sources = &[_][]const u8{"auth-options.c"},
+        .needs_p11sk = true,
+        .needs_testdata = true,
+    },
+    .{
+        .name = "test_bitmap",
+        .dir = "regress/unittests/bitmap",
+        .sources = &[_][]const u8{"tests.c"},
+    },
+    .{
+        .name = "test_conversion",
+        .dir = "regress/unittests/conversion",
+        .sources = &[_][]const u8{"tests.c"},
+    },
+    .{
+        .name = "test_kex",
+        .dir = "regress/unittests/kex",
+        .sources = &[_][]const u8{ "tests.c", "test_kex.c", "test_proposal.c" },
+        .needs_p11sk = true,
+    },
+    .{
+        .name = "test_hostkeys",
+        .dir = "regress/unittests/hostkeys",
+        .sources = &[_][]const u8{ "tests.c", "test_iterate.c" },
+        .needs_p11sk = true,
+        .needs_testdata = true,
+    },
+    .{
+        .name = "test_match",
+        .dir = "regress/unittests/match",
+        .sources = &[_][]const u8{"tests.c"},
+    },
+    .{
+        .name = "test_misc",
+        .dir = "regress/unittests/misc",
+        .sources = &[_][]const u8{
+            "tests.c",          "test_parse.c",     "test_expand.c",
+            "test_convtime.c",  "test_argv.c",       "test_strdelim.c",
+            "test_hpdelim.c",   "test_ptimeout.c",   "test_xextendf.c",
+            "test_misc.c",
+        },
+    },
+    .{
+        .name = "test_servconf",
+        .dir = "regress/unittests/servconf",
+        .sources = &[_][]const u8{"tests.c"},
+        .extra_sources = &[_][]const u8{ "servconf.c", "groupaccess.c" },
+        .needs_p11sk = true,
+    },
+    .{
+        .name = "test_crypto",
+        .dir = "regress/unittests/crypto",
+        .sources = &[_][]const u8{
+            "test_ed25519.c", "test_mldsa.c", "test_mldsa_eddsa.c",
+            "test_mlkem.c",   "tests.c",
+        },
+        .needs_p11sk = true,
+        .needs_testdata = true,
+    },
+    .{
+        .name = "test_utf8",
+        .dir = "regress/unittests/utf8",
+        .sources = &[_][]const u8{"tests.c"},
+    },
+};
+
 pub fn build(b: *std.Build) void {
     // config.h/openbsd-compat/include are frozen for native glibc/Linux;
     // cross-compiling is not expected to work, but the option is left in
@@ -445,6 +567,68 @@ pub fn build(b: *std.Build) void {
         });
         exe.pie = true;
         b.installArtifact(exe);
+    }
+
+    // regress/unittests/test_helper: small assertion/benchmark harness
+    // shared by every unit test below.
+    const test_helper_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_helper_mod.addIncludePath(b.path("."));
+    test_helper_mod.addIncludePath(b.path("openbsd-compat/include"));
+    test_helper_mod.addCSourceFiles(.{
+        .files = &[_][]const u8{
+            "regress/unittests/test_helper/test_helper.c",
+            "regress/unittests/test_helper/fuzz.c",
+        },
+        .flags = &top_flags,
+    });
+    const libtest_helper = b.addLibrary(.{
+        .name = "test_helper",
+        .linkage = .static,
+        .root_module = test_helper_mod,
+    });
+
+    const test_step = b.step("test", "Build and run the regress/unittests/* unit test suite");
+    for (unit_tests) |ut| {
+        const mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addIncludePath(b.path("."));
+        mod.addIncludePath(b.path("openbsd-compat/include"));
+
+        const dir_sources = b.allocator.alloc([]const u8, ut.sources.len) catch @panic("OOM");
+        for (ut.sources, 0..) |src, i| dir_sources[i] = b.pathJoin(&.{ ut.dir, src });
+        mod.addCSourceFiles(.{ .files = dir_sources, .flags = &top_flags });
+
+        if (ut.extra_sources.len > 0)
+            mod.addCSourceFiles(.{ .files = ut.extra_sources, .flags = &top_flags });
+        if (ut.needs_p11sk) {
+            mod.addCSourceFiles(.{ .files = &p11_client_sources, .flags = &top_flags });
+            mod.addCSourceFiles(.{ .files = &sk_client_sources, .flags = &top_flags });
+        }
+        mod.addCSourceFiles(.{ .files = &cleanup_sources, .flags = &top_flags });
+
+        mod.linkLibrary(libssh);
+        mod.linkLibrary(libopenbsd_compat);
+        mod.linkLibrary(libtest_helper);
+        mod.linkSystemLibrary("crypto", .{});
+        mod.linkSystemLibrary("z", .{});
+
+        const exe = b.addExecutable(.{
+            .name = ut.name,
+            .root_module = mod,
+        });
+        exe.pie = true;
+
+        const run = b.addRunArtifact(exe);
+        if (ut.needs_testdata)
+            run.addArgs(&.{ "-d", b.pathJoin(&.{ ut.dir, "testdata" }) });
+        test_step.dependOn(&run.step);
     }
 
     // Using this repository from another Zig project's build.zig:
