@@ -16,9 +16,9 @@
 
     .dependencies = .{},
 
-    // The autotools build (autoreconf/configure/make) needs the whole
-    // source tree -- there is no small, fixed subset of files that would be
-    // sufficient -- so the entire build root is included.
+    // Every .c file, config.h, and the openbsd-compat/include header shims
+    // are needed to build -- there is no small, fixed subset of files that
+    // would be sufficient -- so the entire build root is included.
     .paths = .{
         "",
     },

@@ -1,81 +1,466 @@
 const std = @import("std");
 
-// This build.zig is a thin wrapper around OpenSSH's existing autotools build
-// (autoreconf / configure / make). It does not reimplement the compilation
-// of OpenSSH's several hundred C files in Zig's build graph; instead it
-// drives the existing, well-tested autotools flow using `zig cc` as the C
-// compiler. This lets `zig build` work standalone in this repository, and
-// lets another Zig project depend on this one (see the notes at the bottom
-// of this file for how a consumer should do that).
+// ---------------------------------------------------------------------------
+// A from-scratch Zig build for OpenSSH: every .c file is compiled directly
+// through Zig's build graph (addExecutable/addCSourceFiles) -- there is no
+// autoreconf, automake, autoconf or `make` involved anymore.
+//
+// The trade-off: autoconf's several hundred feature-detection checks are
+// gone. In their place this repository ships a *frozen*, checked-in
+// `config.h` (plus a handful of small header shims under
+// `openbsd-compat/include/`) that was captured once via the project's
+// normal `./configure` on x86_64 Linux/glibc, with OpenSSL, zlib and PAM
+// development headers installed. That means this build.zig only targets
+// that same platform shape (glibc/Linux, OpenSSL 3.x, zlib, PAM). Porting
+// to another OS/libc requires regenerating config.h by hand (or via the
+// autotools flow on the zig16-automake branch) and adjusting the HAVE_*
+// defines to match.
+// ---------------------------------------------------------------------------
+
+// Flags shared by every compiled .c file, taken verbatim from a real
+// `./configure && make CC="zig cc"` build's CFLAGS/CPPFLAGS.
+const common_flags = [_][]const u8{
+    "-g",
+    "-O2",
+    "-pipe",
+    "-Wunknown-warning-option",
+    "-Wno-error=format-truncation",
+    "-Qunused-arguments",
+    "-Wall",
+    "-Wextra",
+    "-Wpointer-arith",
+    "-Wuninitialized",
+    "-Wsign-compare",
+    "-Wformat-security",
+    "-Wsizeof-pointer-memaccess",
+    "-Wno-pointer-sign",
+    "-Wno-unused-parameter",
+    "-Wno-unused-result",
+    "-Wmisleading-indentation",
+    "-Wbitwise-instead-of-logical",
+    "-fno-strict-aliasing",
+    "-D_FORTIFY_SOURCE=2",
+    "-ftrapv",
+    "-fzero-call-used-regs=used",
+    "-ftrivial-auto-var-init=zero",
+    "-mretpoline",
+    "-fno-builtin-memset",
+    "-fstack-protector-strong",
+    "-D_XOPEN_SOURCE=600",
+    "-D_BSD_SOURCE",
+    "-D_DEFAULT_SOURCE",
+    "-D_GNU_SOURCE",
+    "-DOPENSSL_API_COMPAT=0x10100000L",
+    "-DHAVE_CONFIG_H",
+};
+
+// libssh.a, libopenbsd-compat.a and the top-level programs are built -fPIE
+// (matches Makefile.in's plain $(CFLAGS)); openbsd-compat is built -fPIC
+// (matches $(CFLAGS_NOPIE) $(PICFLAG), since historically it could end up
+// in a shared object too).
+const pie_flags = common_flags ++ [_][]const u8{"-fPIE"};
+const pic_flags = common_flags ++ [_][]const u8{"-fPIC"};
+
+const libssh_sources = [_][]const u8{
+    // LIBOPENSSH_OBJS (minus ssh_api.c, see libssh_api_sources below)
+    "ssherr.c",
+    "sshbuf.c",              "sshkey.c",
+    "sshbuf-getput-basic.c", "sshbuf-misc.c",
+    "sshbuf-getput-crypto.c", "krl.c",
+    "bitmap.c",
+    // rest of LIBSSH_OBJS
+    "authfd.c",              "authfile.c",
+    "canohost.c",            "channels.c",
+    "cipher.c",              "cipher-aes.c",
+    "cipher-aesctr.c",
+    "compat.c",              "fatal.c",
+    "hostfile.c",            "log.c",
+    "match.c",               "moduli.c",
+    "nchan.c",               "packet.c",
+    "readpass.c",            "ttymodes.c",
+    "xmalloc.c",             "addr.c",
+    "addrmatch.c",           "atomicio.c",
+    "dispatch.c",            "mac.c",
+    "misc.c",                "utf8.c",
+    "monitor_fdpass.c",      "rijndael.c",
+    "ssh-ecdsa.c",           "ssh-ecdsa-sk.c",
+    "ssh-ed25519-sk.c",      "ssh-rsa.c",
+    "dh.c",                  "msg.c",
+    "dns.c",                 "entropy.c",
+    "gss-genr.c",            "umac.c",
+    "umac128.c",             "smult_curve25519_ref.c",
+    "poly1305.c",            "chacha.c",
+    "cipher-chachapoly.c",   "cipher-chachapoly-libcrypto.c",
+    "ssh-ed25519.c",         "digest-openssl.c",
+    "digest-libc.c",         "libcrux-mlkem-mldsa.c",
+    "ssh-mldsa-eddsa.c",     "hmac.c",
+    "ed25519.c",             "ed25519-openssl.c",
+    "kex.c",                 "kex-names.c",
+    "kexdh.c",               "kexgex.c",
+    "kexecdh.c",             "kexc25519.c",
+    "kexgexc.c",             "kexgexs.c",
+    "kexsntrup761x25519.c",  "kexmlkem768x25519.c",
+    "sntrup761.c",           "kexgen.c",
+    "platform-pledge.c",
+    "platform-tracing.c",    "platform-misc.c",
+    "sshbuf-io.c",           "misc-agent.c",
+    "ssherr-libcrypto.c",
+};
+
+// cleanup_exit() default implementation, used by the programs below that
+// don't provide their own (compare: clientloop.c, scp.c,
+// sftp-server-main.c, ssh-agent.c, ssh-pkcs11-helper.c, sshd.c,
+// sshd-session.c, sshd-auth.c all define their own). Kept out of
+// libssh_sources itself since linking cleanup.c's definition *and* one of
+// those programs' own definitions into the same binary would conflict.
+const cleanup_sources = [_][]const u8{"cleanup.c"};
+
+// Default (non-crypto, "server-side") sftp_realpath() implementation, used
+// directly by sshd-session/sshd-auth/sftp-server (via sftp-server.c). The
+// interactive sftp(1) client instead gets its own client-side
+// sftp_realpath() from sftp-client.c -- the two are incompatible, same-named
+// functions, so (like cleanup.c above) this is kept out of libssh_sources.
+const sftp_realpath_sources = [_][]const u8{"sftp-realpath.c"};
+
+// ssh_api.c provides the embeddable "libssh" API, including
+// mm_choose_dh()/mm_sshkey_sign() stubs used by kexgexs.c when *not* running
+// under the privsep monitor. sshd-session/sshd-auth provide their own real
+// implementations of those two in monitor_wrap.c, so they link libssh
+// without this file (see the `libssh` field on Program below).
+const libssh_api_sources = [_][]const u8{"ssh_api.c"};
+
+const openbsd_compat_sources = [_][]const u8{
+    // COMPAT
+    "openbsd-compat/bsd-asprintf.c",        "openbsd-compat/bsd-closefrom.c",
+    "openbsd-compat/bsd-cygwin_util.c",     "openbsd-compat/bsd-err.c",
+    "openbsd-compat/bsd-flock.c",           "openbsd-compat/bsd-getentropy.c",
+    "openbsd-compat/bsd-getline.c",         "openbsd-compat/bsd-getpagesize.c",
+    "openbsd-compat/bsd-getpeereid.c",      "openbsd-compat/bsd-malloc.c",
+    "openbsd-compat/bsd-misc.c",            "openbsd-compat/bsd-nextstep.c",
+    "openbsd-compat/bsd-openpty.c",         "openbsd-compat/bsd-poll.c",
+    "openbsd-compat/bsd-pselect.c",         "openbsd-compat/bsd-setres_id.c",
+    "openbsd-compat/bsd-signal.c",          "openbsd-compat/bsd-snprintf.c",
+    "openbsd-compat/bsd-statvfs.c",         "openbsd-compat/bsd-timegm.c",
+    "openbsd-compat/bsd-waitpid.c",         "openbsd-compat/fake-rfc2553.c",
+    "openbsd-compat/getrrsetbyname-ldns.c", "openbsd-compat/kludge-fd_set.c",
+    "openbsd-compat/openssl-compat.c",      "openbsd-compat/libressl-api-compat.c",
+    "openbsd-compat/xcrypt.c",
+    // OPENBSD
+    "openbsd-compat/arc4random.c",          "openbsd-compat/arc4random_uniform.c",
+    "openbsd-compat/base64.c",              "openbsd-compat/basename.c",
+    "openbsd-compat/bcrypt_pbkdf.c",        "openbsd-compat/bindresvport.c",
+    "openbsd-compat/blowfish.c",            "openbsd-compat/daemon.c",
+    "openbsd-compat/dirname.c",             "openbsd-compat/explicit_bzero.c",
+    "openbsd-compat/fmt_scaled.c",          "openbsd-compat/freezero.c",
+    "openbsd-compat/fnmatch.c",             "openbsd-compat/getcwd.c",
+    "openbsd-compat/getgrouplist.c",        "openbsd-compat/getopt_long.c",
+    "openbsd-compat/getrrsetbyname.c",      "openbsd-compat/glob.c",
+    "openbsd-compat/inet_aton.c",           "openbsd-compat/inet_ntoa.c",
+    "openbsd-compat/inet_ntop.c",           "openbsd-compat/md5.c",
+    "openbsd-compat/memmem.c",              "openbsd-compat/mktemp.c",
+    "openbsd-compat/pwcache.c",             "openbsd-compat/readpassphrase.c",
+    "openbsd-compat/reallocarray.c",        "openbsd-compat/recallocarray.c",
+    "openbsd-compat/rresvport.c",           "openbsd-compat/setenv.c",
+    "openbsd-compat/setproctitle.c",        "openbsd-compat/sha1.c",
+    "openbsd-compat/sha2.c",                "openbsd-compat/sigact.c",
+    "openbsd-compat/strcasestr.c",          "openbsd-compat/strlcat.c",
+    "openbsd-compat/strlcpy.c",             "openbsd-compat/strmode.c",
+    "openbsd-compat/strndup.c",             "openbsd-compat/strnlen.c",
+    "openbsd-compat/strptime.c",            "openbsd-compat/strsep.c",
+    "openbsd-compat/strtoll.c",             "openbsd-compat/strtonum.c",
+    "openbsd-compat/strtoull.c",            "openbsd-compat/strtoul.c",
+    "openbsd-compat/timingsafe_bcmp.c",     "openbsd-compat/vis.c",
+    // PORTS
+    "openbsd-compat/port-aix.c",            "openbsd-compat/port-irix.c",
+    "openbsd-compat/port-linux.c",          "openbsd-compat/port-prngd.c",
+    "openbsd-compat/port-solaris.c",        "openbsd-compat/port-net.c",
+    "openbsd-compat/port-uw.c",
+};
+
+const p11_client_sources = [_][]const u8{"ssh-pkcs11-client.c"};
+const sk_client_sources = [_][]const u8{"ssh-sk-client.c"};
+const sftp_client_sources = [_][]const u8{
+    "sftp-common.c", "sftp-client.c", "sftp-glob.c", "ssherr-nolibcrypto.c",
+};
+
+const Program = struct {
+    name: []const u8,
+    sources: []const []const u8,
+    /// Needs -lpam -ldl (sshd, sshd-session, sshd-auth).
+    needs_pam: bool = false,
+    /// Which libssh variant (if any) to link:
+    ///  - .full: the normal libssh.a (client-side tools; provides ssh_api.c's
+    ///    non-privsep mm_choose_dh/mm_sshkey_sign stubs used by kexgexs.c).
+    ///  - .no_api: libssh built without ssh_api.c, for the privsep-monitor
+    ///    server binaries that provide their own real
+    ///    mm_choose_dh/mm_sshkey_sign in monitor_wrap.c (linking the .full
+    ///    variant here would duplicate those two symbols).
+    ///  - .no_crypto_err: libssh built without ssherr-libcrypto.c (and
+    ///    without ssh_api.c), for scp/sftp/sftp-server/ssh-sk-helper, which
+    ///    provide their own ssh_err() etc. via ssherr-nolibcrypto.c
+    ///    directly (linking the .full variant here would duplicate that).
+    libssh: enum { full, no_api, no_crypto_err } = .full,
+};
+
+const programs = [_]Program{
+    .{
+        .name = "ssh",
+        .sources = &([_][]const u8{
+            "ssh.c",         "readconf.c", "clientloop.c", "sshtty.c",
+            "sshconnect.c",  "sshconnect2.c", "mux.c",      "ssh-pkcs11.c",
+        } ++ sk_client_sources),
+    },
+    .{
+        .name = "sshd",
+        .needs_pam = true,
+        .sources = &([_][]const u8{
+            "sshd.c",          "platform-listen.c", "servconf.c",
+            "sshpty.c",        "srclimit.c",        "groupaccess.c",
+            "auth2-methods.c", "dns.c",
+        } ++ p11_client_sources ++ sk_client_sources),
+    },
+    .{
+        .name = "sshd-session",
+        .needs_pam = true,
+        .libssh = .no_api,
+        .sources = &([_][]const u8{
+            "sshd-session.c",    "auth-rhosts.c",    "auth-passwd.c",
+            "audit.c",           "audit-bsm.c",      "audit-linux.c",
+            "platform.c",        "sshpty.c",         "sshlogin.c",
+            "servconf.c",        "serverloop.c",     "auth.c",
+            "auth2.c",           "auth2-methods.c",  "auth-options.c",
+            "session.c",         "auth2-chall.c",    "groupaccess.c",
+            "auth-bsdauth.c",    "auth2-hostbased.c", "auth2-kbdint.c",
+            "auth2-none.c",      "auth2-passwd.c",   "auth2-pubkey.c",
+            "auth2-pubkeyfile.c", "monitor.c",       "monitor_wrap.c",
+            "auth-krb5.c",       "auth2-gss.c",      "gss-serv.c",
+            "gss-serv-krb5.c",   "loginrec.c",       "auth-pam.c",
+            "auth-shadow.c",     "auth-sia.c",       "sftp-server.c",
+            "sftp-common.c",     "uidswap.c",        "platform-listen.c",
+        } ++ p11_client_sources ++ sk_client_sources ++ sftp_realpath_sources),
+    },
+    .{
+        .name = "sshd-auth",
+        .needs_pam = true,
+        .libssh = .no_api,
+        .sources = &([_][]const u8{
+            "sshd-auth.c",       "auth2-methods.c",  "auth-rhosts.c",
+            "auth-passwd.c",     "sshpty.c",         "sshlogin.c",
+            "servconf.c",        "serverloop.c",     "auth.c",
+            "auth2.c",           "auth-options.c",   "session.c",
+            "auth2-chall.c",     "groupaccess.c",    "auth-bsdauth.c",
+            "auth2-hostbased.c", "auth2-kbdint.c",   "auth2-none.c",
+            "auth2-passwd.c",    "auth2-pubkey.c",   "auth2-pubkeyfile.c",
+            "auth2-gss.c",       "gss-serv.c",       "gss-serv-krb5.c",
+            "monitor_wrap.c",    "auth-krb5.c",      "audit.c",
+            "audit-bsm.c",       "audit-linux.c",    "platform.c",
+            "loginrec.c",        "auth-pam.c",       "auth-shadow.c",
+            "auth-sia.c",        "sandbox-null.c",   "sandbox-rlimit.c",
+            "sandbox-darwin.c",  "sandbox-seccomp-filter.c", "sandbox-capsicum.c",
+            "sandbox-solaris.c", "sftp-server.c",    "sftp-common.c",
+            "uidswap.c",
+        } ++ p11_client_sources ++ sk_client_sources ++ sftp_realpath_sources),
+    },
+    .{
+        .name = "ssh-add",
+        .sources = &([_][]const u8{"ssh-add.c"} ++ p11_client_sources ++ sk_client_sources ++ cleanup_sources),
+    },
+    .{
+        .name = "ssh-agent",
+        .sources = &([_][]const u8{"ssh-agent.c"} ++ p11_client_sources ++ sk_client_sources),
+    },
+    .{
+        .name = "ssh-keygen",
+        .sources = &([_][]const u8{ "ssh-keygen.c", "sshsig.c", "ssh-pkcs11.c" } ++ sk_client_sources ++ cleanup_sources),
+    },
+    .{
+        .name = "ssh-keysign",
+        .sources = &([_][]const u8{ "ssh-keysign.c", "readconf.c", "uidswap.c" } ++ p11_client_sources ++ sk_client_sources ++ cleanup_sources),
+    },
+    .{
+        .name = "ssh-pkcs11-helper",
+        .sources = &([_][]const u8{ "ssh-pkcs11-helper.c", "ssh-pkcs11.c" } ++ sk_client_sources),
+    },
+    .{
+        .name = "ssh-keyscan",
+        .sources = &([_][]const u8{"ssh-keyscan.c"} ++ p11_client_sources ++ sk_client_sources ++ cleanup_sources),
+    },
+    .{
+        .name = "ssh-sk-helper",
+        .libssh = .no_crypto_err,
+        .sources = &([_][]const u8{ "ssh-sk-helper.c", "ssh-sk.c", "sk-usbhid.c", "ssherr-nolibcrypto.c" } ++ cleanup_sources),
+    },
+    .{
+        .name = "scp",
+        .libssh = .no_crypto_err,
+        .sources = &([_][]const u8{ "scp.c", "progressmeter.c" } ++ sftp_client_sources),
+    },
+    .{
+        .name = "sftp",
+        .libssh = .no_crypto_err,
+        .sources = &([_][]const u8{ "sftp.c", "sftp-usergroup.c", "progressmeter.c" } ++ sftp_client_sources ++ cleanup_sources),
+    },
+    .{
+        .name = "sftp-server",
+        .libssh = .no_crypto_err,
+        .sources = &([_][]const u8{ "sftp-common.c", "sftp-server.c", "sftp-server-main.c", "ssherr-nolibcrypto.c" } ++ sftp_realpath_sources),
+    },
+};
+
 pub fn build(b: *std.Build) void {
-    const with_pam = b.option(bool, "pam", "Enable PAM support (default: true)") orelse true;
-    const with_kerberos = b.option(bool, "kerberos", "Enable Kerberos5/GSSAPI support (default: false)") orelse false;
-    const with_selinux = b.option(bool, "selinux", "Enable SELinux support (default: false)") orelse false;
-    const reconfigure = b.option(bool, "reconfigure", "Force re-running autoreconf and configure (default: false)") orelse false;
-    const configure_args = b.option([]const []const u8, "configure-arg", "Extra argument to forward to ./configure (may be repeated)") orelse &.{};
-    const jobs = b.option(u32, "jobs", "make -j parallelism (default: number of CPUs)");
+    // config.h/openbsd-compat/include are frozen for native glibc/Linux;
+    // cross-compiling is not expected to work, but the option is left in
+    // place since it's otherwise idiomatic zig build boilerplate.
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
 
-    // Everything below operates in-tree, i.e. directly inside this
-    // package's source root (`b.path(".")`), exactly like a manual
-    // `./configure && make` checkout build. This keeps the wrapper simple
-    // and matches how the project is built today.
-    const root = b.path(".");
+    const prefix = b.option([]const u8, "install-prefix", "Baked-in default install prefix (default: /usr/local)") orelse "/usr/local";
+    const sysconfdir = b.option([]const u8, "sysconfdir", "Baked-in default config directory") orelse b.fmt("{s}/etc", .{prefix});
+    const piddir = b.option([]const u8, "piddir", "Baked-in default pid file directory") orelse "/var/run";
+    const privsep_path = b.option([]const u8, "privsep-path", "Baked-in privilege separation chroot directory") orelse "/var/empty";
 
-    var prev_step: ?*std.Build.Step = null;
-    const io = b.graph.io;
+    const path_flags = [_][]const u8{
+        b.fmt("-DSSHDIR=\"{s}\"", .{sysconfdir}),
+        b.fmt("-D_PATH_SSH_PROGRAM=\"{s}/bin/ssh\"", .{prefix}),
+        b.fmt("-D_PATH_SSH_ASKPASS_DEFAULT=\"{s}/libexec/ssh-askpass\"", .{prefix}),
+        b.fmt("-D_PATH_SFTP_SERVER=\"{s}/libexec/sftp-server\"", .{prefix}),
+        b.fmt("-D_PATH_SSH_KEY_SIGN=\"{s}/libexec/ssh-keysign\"", .{prefix}),
+        b.fmt("-D_PATH_SSHD_SESSION=\"{s}/libexec/sshd-session\"", .{prefix}),
+        b.fmt("-D_PATH_SSHD_AUTH=\"{s}/libexec/sshd-auth\"", .{prefix}),
+        b.fmt("-D_PATH_SSH_PKCS11_HELPER=\"{s}/libexec/ssh-pkcs11-helper\"", .{prefix}),
+        b.fmt("-D_PATH_SSH_SK_HELPER=\"{s}/libexec/ssh-sk-helper\"", .{prefix}),
+        b.fmt("-D_PATH_SSH_PIDDIR=\"{s}\"", .{piddir}),
+        b.fmt("-D_PATH_PRIVSEP_CHROOT_DIR=\"{s}\"", .{privsep_path}),
+    };
+    const top_flags = pie_flags ++ path_flags;
 
-    const have_configure = if (b.build_root.handle.access(io, "configure", .{})) |_| true else |_| false;
-    if (reconfigure or !have_configure) {
-        const autoreconf = b.addSystemCommand(&.{ "autoreconf", "-i" });
-        autoreconf.setCwd(root);
-        prev_step = &autoreconf.step;
+    // libssh_sources minus one file, for building the alternate libssh
+    // variants below (see the `libssh` field comment on Program).
+    const arena = b.allocator;
+    const excluding = struct {
+        fn call(alloc: std.mem.Allocator, list: []const []const u8, exclude: []const u8) []const []const u8 {
+            var out: std.ArrayListUnmanaged([]const u8) = .empty;
+            for (list) |item| {
+                if (!std.mem.eql(u8, item, exclude)) out.append(alloc, item) catch @panic("OOM");
+            }
+            return out.toOwnedSlice(alloc) catch @panic("OOM");
+        }
+    }.call;
+    const libssh_sources_no_crypto_err = excluding(arena, &libssh_sources, "ssherr-libcrypto.c");
+
+    // libopenbsd-compat.a: OpenBSD/BSD portability shims. Always compiled
+    // in full; unneeded functions become no-ops via config.h HAVE_* guards.
+    const compat_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    compat_mod.addIncludePath(b.path("."));
+    compat_mod.addIncludePath(b.path("openbsd-compat"));
+    compat_mod.addIncludePath(b.path("openbsd-compat/include"));
+    compat_mod.addCSourceFiles(.{ .files = &openbsd_compat_sources, .flags = &pic_flags });
+    const libopenbsd_compat = b.addLibrary(.{
+        .name = "openbsd-compat",
+        .linkage = .static,
+        .root_module = compat_mod,
+    });
+
+    // libssh.a: the shared protocol/crypto/utility code linked into every
+    // client-side program below. Includes ssh_api.c (see comment above).
+    const ssh_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ssh_mod.addIncludePath(b.path("."));
+    ssh_mod.addIncludePath(b.path("openbsd-compat/include"));
+    ssh_mod.addCSourceFiles(.{ .files = &libssh_sources, .flags = &top_flags });
+    ssh_mod.addCSourceFiles(.{ .files = &libssh_api_sources, .flags = &top_flags });
+    const libssh = b.addLibrary(.{
+        .name = "ssh",
+        .linkage = .static,
+        .root_module = ssh_mod,
+    });
+
+    // Same as libssh, but without ssh_api.c, for the privsep-monitor server
+    // binaries (sshd-session, sshd-auth) -- see the `libssh` field comment
+    // on Program above.
+    const ssh_no_api_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ssh_no_api_mod.addIncludePath(b.path("."));
+    ssh_no_api_mod.addIncludePath(b.path("openbsd-compat/include"));
+    ssh_no_api_mod.addCSourceFiles(.{ .files = &libssh_sources, .flags = &top_flags });
+    const libssh_no_api = b.addLibrary(.{
+        .name = "ssh-no-api",
+        .linkage = .static,
+        .root_module = ssh_no_api_mod,
+    });
+
+    // Same as libssh, but without ssherr-libcrypto.c or ssh_api.c, for the
+    // non-crypto sftp/scp/ssh-sk-helper tools, which provide their own
+    // ssh_err() etc. via ssherr-nolibcrypto.c directly (see the `libssh`
+    // field comment on Program above).
+    const ssh_no_crypto_err_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ssh_no_crypto_err_mod.addIncludePath(b.path("."));
+    ssh_no_crypto_err_mod.addIncludePath(b.path("openbsd-compat/include"));
+    ssh_no_crypto_err_mod.addCSourceFiles(.{ .files = libssh_sources_no_crypto_err, .flags = &top_flags });
+    const libssh_no_crypto_err = b.addLibrary(.{
+        .name = "ssh-no-crypto-err",
+        .linkage = .static,
+        .root_module = ssh_no_crypto_err_mod,
+    });
+
+    for (programs) |prog| {
+        const mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        mod.addIncludePath(b.path("."));
+        mod.addIncludePath(b.path("openbsd-compat/include"));
+        mod.addCSourceFiles(.{ .files = prog.sources, .flags = &top_flags });
+        switch (prog.libssh) {
+            .full => mod.linkLibrary(libssh),
+            .no_api => mod.linkLibrary(libssh_no_api),
+            .no_crypto_err => mod.linkLibrary(libssh_no_crypto_err),
+        }
+        mod.linkLibrary(libopenbsd_compat);
+        mod.linkSystemLibrary("crypto", .{});
+        mod.linkSystemLibrary("z", .{});
+        if (prog.needs_pam) {
+            mod.linkSystemLibrary("pam", .{});
+            mod.linkSystemLibrary("dl", .{});
+        }
+
+        const exe = b.addExecutable(.{
+            .name = prog.name,
+            .root_module = mod,
+        });
+        exe.pie = true;
+        b.installArtifact(exe);
     }
-
-    const have_makefile = if (b.build_root.handle.access(io, "Makefile", .{})) |_| true else |_| false;
-    if (reconfigure or !have_makefile) {
-        const configure = b.addSystemCommand(&.{"./configure"});
-        configure.setCwd(root);
-        configure.setEnvironmentVariable("CC", "zig cc");
-        if (with_pam) configure.addArg("--with-pam");
-        if (with_kerberos) configure.addArg("--with-kerberos5");
-        if (with_selinux) configure.addArg("--with-selinux");
-        configure.addArgs(configure_args);
-        if (prev_step) |s| configure.step.dependOn(s);
-        prev_step = &configure.step;
-    }
-
-    const make = b.addSystemCommand(&.{"make"});
-    make.setCwd(root);
-    const jobs_arg = b.fmt("-j{d}", .{jobs orelse @as(u32, @intCast(std.Thread.getCpuCount() catch 1))});
-    make.addArg(jobs_arg);
-    if (prev_step) |s| make.step.dependOn(s);
-
-    b.getInstallStep().dependOn(&make.step);
-
-    // `zig build test` builds and runs OpenSSH's self-contained unit tests
-    // (regress/unittests/*), i.e. `make unit`.
-    const unit = b.addSystemCommand(&.{ "make", "unit" });
-    unit.setCwd(root);
-    unit.step.dependOn(&make.step);
-    const test_step = b.step("test", "Run OpenSSH's unit test suite (make unit)");
-    test_step.dependOn(&unit.step);
-
-    // `zig build clean` runs `make distclean`, undoing autoreconf/configure
-    // as well as the compiled objects/binaries.
-    const clean = b.addSystemCommand(&.{ "make", "distclean" });
-    clean.setCwd(root);
-    const clean_step = b.step("clean", "Remove all configure/build output (make distclean)");
-    clean_step.dependOn(&clean.step);
 
     // Using this repository from another Zig project's build.zig:
     //
     //   const openssh_dep = b.dependency("openssh_portable", .{
-    //       .pam = true,
+    //       .target = target,
+    //       .optimize = optimize,
     //   });
-    //   // Make sure configure/make has actually run before relying on the
-    //   // binaries below:
-    //   my_step.dependOn(openssh_dep.builder.getInstallStep());
-    //   // Built binaries land in-tree, next to the fetched sources:
-    //   const ssh_exe = openssh_dep.path("ssh");
-    //   const sshd_exe = openssh_dep.path("sshd");
+    //   const ssh_exe = openssh_dep.artifact("ssh");
+    //   const sshd_exe = openssh_dep.artifact("sshd-session");
+    //   b.installArtifact(ssh_exe);
+    //
+    // Every program in `programs` above is a real `*Step.Compile` installed
+    // via `b.installArtifact`, so `dep.artifact("<name>")` works for any of
+    // them (ssh, sshd, sshd-session, sshd-auth, scp, sftp, sftp-server,
+    // ssh-add, ssh-agent, ssh-keygen, ssh-keyscan, ssh-keysign,
+    // ssh-pkcs11-helper, ssh-sk-helper).
 }
+
