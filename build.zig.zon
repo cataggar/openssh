@@ -1,0 +1,25 @@
+.{
+    // Default name used by projects depending on this package, e.g. in a
+    // consumer's `zig fetch --save <url>` or `.dependencies` table.
+    .name = .openssh_portable,
+
+    // Mirrors the upstream OpenSSH release this checkout is based on
+    // (see version.h: SSH_VERSION "OpenSSH_10.4").
+    .version = "10.4.0",
+
+    // Globally unique package id, generated once and never changed
+    // afterwards so that forks/renames can still be recognized as the same
+    // package lineage.
+    .fingerprint = 0x5da798360bdecbd2,
+
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{},
+
+    // The autotools build (autoreconf/configure/make) needs the whole
+    // source tree -- there is no small, fixed subset of files that would be
+    // sufficient -- so the entire build root is included.
+    .paths = .{
+        "",
+    },
+}
